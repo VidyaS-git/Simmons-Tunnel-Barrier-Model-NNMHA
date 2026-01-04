@@ -1,0 +1,131 @@
+* =============================================================================
+* Pickett / Simmons Tunnel-Barrier Memristor (ngspice/PySpice)
+* Robust "safe-math" implementation to avoid ln(0), division-by-zero, and
+* sqrt of negative due to numerical noise.
+*
+* State variable: x = w  (tunnel gap width, meters)
+* Nodes: te be x dx
+*
+* References:
+*  - The device is modeled as series resistor + Simmons tunnel barrier; the
+*    full expression set is provided in the paper's supplementary material.
+* =============================================================================
+.subckt MEM te be x dx
+
+* ------------------------------
+* Physical / fit parameters
+* (defaults match values commonly used for the TiO2 bipolar switch examples;
+* you can override with .param in the parent netlist if needed)
+* ------------------------------
+.param Phi0_eV  = 0.95
+.param k_diel   = 10
+.param A_area   = 1.0e-14
+.param m_eff    = 9.31e-31
+.param e_ch     = 1.60217663e-19
+.param h_pl     = 6.62607015e-34
+.param eps0     = 8.854e-12
+
+* State bounds (meters)
+.param a_off    = 1.2e-9
+.param a_on     = 1.8e-9
+
+* Switching dynamics parameters (from fitted model)
+.param f_off    = 3.5e-6
+.param f_on     = 40e-6
+.param i_off    = 115e-6
+.param i_on     = 8.9e-6
+.param x_c      = 0.107e-9
+.param b        = 500e-6
+
+* Series resistance
+.param Rseries  = 215
+
+* ------------------------------
+* Numerics / safety parameters
+* ------------------------------
+.param eps_phi  = 1e-9        ; eV floor for barrier height
+.param eps_ln   = 1e-18       ; floor for log arguments
+.param eps_div  = 1e-18       ; floor for denominators
+.param eps_w    = 1e-12       ; floor for widths (m)
+
+* ------------------------------
+* Precomputed constants (ngspice can handle these, but keeping them explicit
+* makes units clear and avoids tiny/huge intermediate results)
+* ------------------------------
+.func j0Ae()      { (e_ch/(2*pi*h_pl)) * A_area * e_ch }          ; Eq (prefactor)
+.func betae()     { (4*pi*sqrt(2*m_eff)/h_pl) * e_ch }            ; beta*e
+.func lambdaw_e() { e_ch*log(2)/(8*pi*k_diel*eps0) }              ; lambda*w (eV*m)
+
+* Eq 24a: w1 = 1.2*lambda/phi0   (lambda here is lambdaw_e / w, so w1 is constant)
+.param w1 = { 1.2*lambdaw_e()/Phi0_eV }
+
+* ------------------------------
+* Safe helper functions
+* ------------------------------
+.func clamp(x, lo, hi) { min(max(x, lo), hi) }
+.func safe_sqrt(x)     { sqrt(max(x, eps_phi)) }
+.func safe_ln(x)       { ln(max(x, eps_ln)) }
+.func safe_div(a,b)    { a / max(abs(b), eps_div) }
+
+.func xlim(w)          { clamp(w, a_off, a_on) }
+
+* ------------------------------
+* Simmons tunnel-barrier helper equations
+* (The exact expression set is in the supplementary material referenced by the
+* paper; this implementation follows the common Pickett-style formulation.)
+* ------------------------------
+
+* Eq 26: Lambda = lambdaw_e / w
+.func lambda_e(w) { lambdaw_e() / max(w, eps_w) }
+
+* Eq 25: w2(w,v)
+.func denom_w2(w,v) { 3*Phi0_eV + 4*lambda_e(w) - 2*v }
+.func w2(w,v) { w1 + w * ( 1 - safe_div(9.2*lambda_e(w), denom_w2(w,v)) ) }
+
+* Eq 24b: Delta w
+.func dw(w,v) { w2(w,v) - w1 }
+
+* Eq 22: Be = betae * Delta w
+.func Be(w,v) { betae() * dw(w,v) }
+
+* Eq 23: Phi1/e  (mean barrier height, eV)
+* log argument rewritten to avoid sign flips; clamp to small positive floor.
+.func logarg(w,v) {
++ safe_div( (w/w1 - 1), (w/w2(w,v) - 1) )
++}
+.func Phi1_e(w,v) {
++ Phi0_eV
++ - v * ((w1 + w2(w,v)) / (2*max(w, eps_w)))
++ - 1.15 * safe_div(lambdaw_e(), dw(w,v)) * safe_ln(logarg(w,v))
++}
+
+* Eq 20: Current magnitude (Simmons-like form)
+.func term1(w,v) { Phi1_e(w,v) * exp( -Be(w,v) * sqrt( max(Phi1_e(w,v), eps_phi) ) / sqrt(e_ch) ) }
+.func term2(w,v) { (Phi1_e(w,v)+v) * exp( -Be(w,v) * sqrt( max(Phi1_e(w,v)+v, eps_phi) ) / sqrt(e_ch) ) }
+.func simmons(w,v) { safe_div(j0Ae(), (dw(w,v)*dw(w,v))) * (term1(w,v) - term2(w,v)) }
+
+* ------------------------------
+* Circuit: series resistor + behavioral current source
+* ------------------------------
+Rs te me {Rseries}
+
+* Use magnitude with abs(v) and restore polarity with sgn(v)
+Bi me be I = { sgn(V(me,be)) * simmons(xlim(V(x)), abs(V(me,be))) }
+
+* ------------------------------
+* State dynamics (w-dot) with safe exponentials
+* Branch choice follows common convention:
+*  - I(Bi) > 0 : OFF switching branch
+*  - I(Bi) <=0 : ON  switching branch
+* ------------------------------
+.func wdot_off(w,i) { f_off*sinh(i/i_off) * exp( -exp( max(w-a_off,0)/x_c - abs(i)/b ) - w/x_c ) }
+.func wdot_on (w,i) { f_on *sinh(i/i_on ) * exp( -exp( -max(w-a_on ,0)/x_c - abs(i)/b ) - w/x_c ) }
+
+B_w 0 x I = { I(Bi) > 0 ? wdot_off(xlim(V(x)), I(Bi)) : wdot_on(xlim(V(x)), I(Bi)) }
+C_w x 0 1
+R_w x 0 1G
+
+* Derivative monitor (V(dx) = wdot)
+B_dx dx 0 V = { I(Bi) > 0 ? wdot_off(xlim(V(x)), I(Bi)) : wdot_on(xlim(V(x)), I(Bi)) }
+
+.ends MEM

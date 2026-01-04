@@ -1,0 +1,20 @@
+
+* IV test (triangular stimulus)
+.include "C:/Users/Vidya/OneDrive/Desktop/Materials/Sem1/Neural networks/Voluntary Proj/Simmons Tunnel Barrier Model/Core Code/mem_simmons_pickett.subckt"
+
+* instance (override params explicitly)
+Xmem te 0 w dwdt MEM xinit=0.2 Ron=200 Roff=200k k=2e3 p=2
+
+Vin te 0 PWL( 0 0  0.0025 1.2  0.0075 -1.2  0.01 0 )
+
+.tran 10u 0.01
+
+.control
+set filetype=ascii
+run
+* IMPORTANT: write to local file name (Windows ngspice hates long paths)
+wrdata iv.csv time v(te) i(vin) v(w) v(dwdt)
+quit
+.endc
+
+.end
